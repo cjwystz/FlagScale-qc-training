@@ -120,6 +120,7 @@ model:
   micro_batch_size: 2
   global_batch_size: 2048
   eval_iters: 0
+  eval_interval: 1000
   train_iters: 20
 
   optimizer:
@@ -142,7 +143,6 @@ data:
   split: 1
   no_mmap_bin_files: true
   tokenizer:
-    legacy_tokenizer: true
     tokenizer_type: QwenTokenizerFS
     tokenizer_path: /workspace/qwentokenizer
     vocab_size: 151851
