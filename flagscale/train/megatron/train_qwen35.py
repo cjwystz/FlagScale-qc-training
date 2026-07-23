@@ -33,6 +33,8 @@ from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import StragglerDetector
 
 from megatron.training.utils import unwrap_model
+from megatron.training.utils import is_first_or_last_pipeline_stage
+from megatron.core.transformer.multi_token_prediction import mtp_on_this_rank
 from megatron.training import get_args, get_timers, get_tokenizer, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
 from megatron.training.yaml_arguments import core_transformer_config_from_yaml
@@ -47,12 +49,10 @@ except ImportError:
     has_nvidia_modelopt = False
 
 from megatron.training.training import pretrain
-
 stimer = StragglerDetector()
 
 # Qwen2.5-VL data handling
 from megatron.core.num_microbatches_calculator import get_num_microbatches
-
 torch._dynamo.config.suppress_errors = True
 from megatron.core.parallel_state import (
     get_tensor_model_parallel_rank,
@@ -83,12 +83,11 @@ from flagscale.models.megatron.qwen35.transformer_config import (
 from flagscale.models.megatron.qwen35.layer_specs import (
     get_qwen35_language_model_spec,
     get_qwen35_mtp_block_spec,
-    get_mlp_module_spec,
+    get_mlp_module_spec
 )
 from flagscale.models.megatron.qwen3_vl.layer_specs import get_qwen3vl_vision_model_spec
 
 from megatron.plugin.platform import get_platform
-
 cur_platform = get_platform()
 
 from tools.datasets.qwenvl.data.dataset_helpers import TaskEncoder, print_error_handler
@@ -103,22 +102,23 @@ def model_provider(
     args = get_args()
     print_rank_0("start building qwen3.5 model ...")
 
+    # NOTE(vpp): When virtual pipeline parallelism is on, Megatron's get_model()
+    # builds one chunk per virtual stage and passes vp_stage=i via kwargs. We must
+    # forward it to Qwen35Model so MTP placement (mtp_on_this_rank) and language
+    # layer counting land on the correct virtual stage. Defaults to None (VPP off).
+    vp_stage = kwargs.get("vp_stage", None)
+
     # Build transformer config with Qwen35 config class
     config = core_transformer_config_from_args(args, Qwen35TransformerConfig)
     # Qwen3.5 uses zero-centered gamma for RMSNorm; override if needed
     # (core_transformer_config_from_args may be affected by apply_layernorm_1p)
-    config.layernorm_zero_centered_gamma = getattr(args, "layernorm_zero_centered_gamma", True)
+    config.layernorm_zero_centered_gamma = getattr(args, 'layernorm_zero_centered_gamma', True)
     use_te = args.transformer_impl == "transformer_engine"
     if not use_te:
         raise NotImplementedError("Qwen3.5 model is only implemented with TransformerEngine!")
 
-    if (
-        args.rotary_seq_len_interpolation_factor is not None
-        or args.rotary_seq_len_interpolation_factor != 1
-    ):
-        print_rank_0(
-            "Multimodal RoPE currently does not support RoPE interpolation, set to None..."
-        )
+    if args.rotary_seq_len_interpolation_factor is not None or args.rotary_seq_len_interpolation_factor != 1:
+        print_rank_0('Multimodal RoPE currently does not support RoPE interpolation, set to None...')
         args.rotary_seq_len_interpolation_factor = None
 
     # Vision configs (identical encoder to Qwen3-VL)
@@ -132,7 +132,7 @@ def model_provider(
     print_rank_0("building Qwen3.5 model in TE...")
 
     # Language model spec: hybrid GDN + Attention
-    language_layer_spec = get_qwen35_language_model_spec(config)
+    language_layer_spec = get_qwen35_language_model_spec(config, vp_stage=vp_stage)
 
     # Vision model spec (identical to Qwen3-VL)
     vision_model_spec = get_qwen3vl_vision_model_spec()
@@ -142,7 +142,7 @@ def model_provider(
         config.variable_seq_lengths = True
 
     # MTP (Multi-Token Prediction) spec
-    mtp_block_spec = get_qwen35_mtp_block_spec(args, config)
+    mtp_block_spec = get_qwen35_mtp_block_spec(args, config, vp_stage=vp_stage)
 
     args.padded_vocab_size = args.vocab_size
     model = Qwen35Model(
@@ -150,22 +150,27 @@ def model_provider(
         language_transformer_layer_spec=language_layer_spec,
         language_vocab_size=args.padded_vocab_size,
         language_max_sequence_length=args.max_position_embeddings,
+
         vision_transformer_config=vision_config,
         vision_transformer_layer_spec=vision_model_spec,
         vision_projection_config=vision_projector_config,
         vision_projection_layer_spec=vision_projector_spec,
-        vision_projection_type="mlp",
+        vision_projection_type='mlp',
+
         language_position_embedding_type=args.position_embedding_type,
         language_rotary_percent=args.rotary_percent,
         language_rotary_base=args.rotary_base,
+
         pre_process=pre_process,
         post_process=post_process,
         add_decoder=add_decoder,
         add_encoder=add_encoder,
+
         fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
         parallel_output=True,
         language_share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
         mtp_block_spec=mtp_block_spec,
+        vp_stage=vp_stage,
     )
 
     model.freeze(
@@ -208,7 +213,9 @@ def get_ltor_masks_and_position_ids(
     return attention_mask, loss_mask, position_ids
 
 
-def get_batch(data_iterator, model: Qwen35Model = None) -> Tuple:
+def get_batch(
+    data_iterator, model: Qwen35Model = None, vp_stage: int = None
+) -> Tuple:
     """Generate a batch."""
     imgs = None
     tokens = None
@@ -216,6 +223,22 @@ def get_batch(data_iterator, model: Qwen35Model = None) -> Tuple:
     loss_mask = None
     attention_mask = None
     position_ids = None
+
+    # NOTE(vpp): Under virtual pipeline parallelism the interleaved scheduler calls
+    # forward_step once per local model chunk. Only the first/last pipeline stage
+    # (and MTP ranks) need real data -- middle chunks receive their input via
+    # set_input_tensor (the activation from the previous stage), so they must NOT
+    # pull from the data iterator (would over-consume the energon stream and feed
+    # stale tokens into a chunk whose pre_process is False). Mirrors train_gpt.py.
+    # When vp_stage is None (VPP off) is_first_or_last_pipeline_stage ignores
+    # virtual staging and returns True, preserving the original single-chunk path.
+    args = get_args()
+    config = core_transformer_config_from_args(args, Qwen35TransformerConfig)
+    is_middle_vpp_chunk = not is_first_or_last_pipeline_stage(
+        vp_stage
+    ) and not mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage)
+    if is_middle_vpp_chunk and data_iterator is None:
+        return (None, None, None, None, None, None, None, None, None, None, None)
 
     cur_platform.range_push("get_data")
     if data_iterator is not None and get_tensor_model_parallel_rank() == 0:
@@ -241,9 +264,7 @@ def get_batch(data_iterator, model: Qwen35Model = None) -> Tuple:
         cur_platform.empty_cache()
 
     video_thw_grids = broadcast_data(["video_thw_grids"], data, torch.long)["video_thw_grids"]
-    second_per_grid_ts = broadcast_data(["second_per_grid_ts"], data, torch.float32)[
-        "second_per_grid_ts"
-    ]
+    second_per_grid_ts = broadcast_data(['second_per_grid_ts'], data, torch.float32)['second_per_grid_ts']
     image_input_mask = broadcast_data(["image_input_mask"], data, torch.bool)["image_input_mask"]
     video_input_mask = broadcast_data(["video_input_mask"], data, torch.bool)["video_input_mask"]
     cur_platform.range_pop()
@@ -269,6 +290,26 @@ def get_batch(data_iterator, model: Qwen35Model = None) -> Tuple:
         model=model,
     )
     cur_platform.range_pop()
+
+    if is_middle_vpp_chunk:
+        # mRoPE position_ids are data-dependent: every VPP chunk's decoder needs
+        # them for rotary embeddings, so middle chunks must also pull data (each
+        # chunk has its own data iterator under VPP, kept in sync by the
+        # scheduler) and compute position_ids/attention_mask. Vision tensors and
+        # labels are unused when pre_process is False.
+        return (
+            None,
+            None,
+            None,
+            attention_mask,
+            position_ids,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
 
     return (
         tokens,
@@ -336,7 +377,7 @@ def loss_func(
     num_tokens = loss_mask.sum().clone().detach().to(torch.int)
     reporting_loss = torch.cat([loss.clone().detach().view(1), num_tokens.view(1)])
 
-    return (loss, num_tokens, {"lm loss": reporting_loss})
+    return (loss, num_tokens, {'lm loss': reporting_loss})
 
 
 def forward_step(data_iterator, model: Qwen35Model):
@@ -344,7 +385,13 @@ def forward_step(data_iterator, model: Qwen35Model):
     args = get_args()
     timers = get_timers()
 
-    timers("batch-generator", log_level=2).start()
+    # NOTE(vpp): The interleaved (VPP) scheduler invokes forward_step once per local
+    # model chunk and tags each chunk's model with .vp_stage. Extract it so get_batch
+    # can decide whether this chunk needs real data. unwrap_model peels DDP/Float16
+    # wrappers; vp_stage defaults to None when VPP is off.
+    vp_stage = getattr(unwrap_model(model), "vp_stage", None)
+
+    timers('batch-generator', log_level=2).start()
     global stimer
     with stimer(bdata=True):
         (
@@ -359,8 +406,25 @@ def forward_step(data_iterator, model: Qwen35Model):
             video_thw_grids,
             image_input_mask,
             video_input_mask,
-        ) = get_batch(data_iterator, model=unwrap_model(model))
-    timers("batch-generator").stop()
+        ) = get_batch(data_iterator, model=unwrap_model(model), vp_stage=vp_stage)
+    timers('batch-generator').stop()
+
+    # Middle VPP chunks (pre_process=False) receive their input activation via
+    # set_input_tensor and get None tokens/vision from get_batch. Skip vision
+    # assembly and let Qwen35Model.forward take its non-pre_process branch
+    # (vision ignored). position_ids/attention_mask are real: the decoder of a
+    # middle chunk still needs them for mRoPE and variable-length attention.
+    if tokens is None:
+        with stimer:
+            output_tensor = model(
+                input_ids=None,
+                position_ids=position_ids,
+                vision_data=None,
+                vision_grid_thw=None,
+                attention_mask=attention_mask,
+                labels=None,
+            )
+        return output_tensor, partial(loss_func, loss_mask, model=model)
 
     vision_data = torch.cat([imgs, videos], dim=0)
     vision_grid = torch.cat([image_thw_grids, video_thw_grids], dim=0)
@@ -376,7 +440,6 @@ def forward_step(data_iterator, model: Qwen35Model):
             video_input_mask=video_input_mask,
             attention_mask=attention_mask,
             labels=labels,
-            loss_mask=loss_mask,
         )
 
     return output_tensor, partial(loss_func, loss_mask, model=model)
@@ -441,8 +504,16 @@ def is_dataloader_rank(transformer_pipeline_model_parallel_size):
     return is_first_rank
 
 
-def train_valid_test_dataloaders_provider(train_val_test_num_samples):
-    """Build multimodal train, validation and test dataloaders."""
+def train_valid_test_dataloaders_provider(train_val_test_num_samples, vp_stage=None):
+    """Build multimodal train, validation and test dataloaders.
+
+    NOTE(vpp): vp_stage is required as a kwarg when VPP is on -- pretrain() builds
+    one data iterator per virtual stage via functools.partial(provider, vp_stage=i)
+    and asserts the signature accepts it. The energon multimodal stream is identical
+    across virtual stages (all chunks would see the same samples), so we accept the
+    argument but do not use it for data partitioning. Per-chunk data gating happens
+    later in get_batch (only first/last/MTP chunks actually pull from the iterator).
+    """
     args = get_args()
     if not is_dataloader_rank(args.transformer_pipeline_model_parallel_size):
         return None, None, None
@@ -476,9 +547,7 @@ def train_valid_test_dataloaders_provider(train_val_test_num_samples):
             )
             if os.path.exists(data_save_name):
                 try:
-                    dataset_state_dict = torch.load(
-                        data_save_name, map_location="cpu", weights_only=False
-                    )
+                    dataset_state_dict = torch.load(data_save_name, map_location="cpu", weights_only=False)
                     train_dataloader.restore_state_rank(dataset_state_dict["dataloader_state_dict"])
                     print_rank_0(f"restored dataset state from {data_save_name}")
                 except Exception as e:
@@ -498,7 +567,6 @@ def train_valid_test_dataloaders_provider(train_val_test_num_samples):
 
 class EnergonDataloader:
     """Wrapper for Megatron Energon dataloader."""
-
     def __init__(self, dataloader):
         self._dataloader = dataloader
         self._iter = iter(cyclic_iter(dataloader))
@@ -537,9 +605,7 @@ def add_qwen35_extra_args(parser):
     group.add_argument("--image-max-pixels", type=int, default=768 * 768)
     group.add_argument("--image-min-pixels", type=int, default=32 * 32)
     group.add_argument("--vision-recompute-activations", action="store_true", default=False)
-    group.add_argument(
-        "--no-use-system-prompt", dest="use_system_prompt", action="store_false", default=True
-    )
+    group.add_argument("--no-use-system-prompt", dest="use_system_prompt", action="store_false", default=True)
     group.add_argument(
         "--convert-checkpoint-from-megatron-to-transformers",
         action="store_true",
@@ -572,7 +638,7 @@ if __name__ == "__main__":
         model_provider,
         ModelType.encoder_or_decoder,
         forward_step,
-        args_defaults={"tokenizer_type": "Qwen2VLTokenizer"},
+        args_defaults={'tokenizer_type': 'Qwen2VLTokenizer'},
         extra_args_provider=add_qwen35_extra_args,
         process_non_loss_data_func=write_online_eval_to_tensorboard,
         non_loss_data_func=run_online_eval,
